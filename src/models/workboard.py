@@ -1,0 +1,161 @@
+from pydantic import BaseModel, Field, model_validator
+from typing import Dict, Optional, List
+import uuid
+from datetime import datetime
+from src.models.workitem import WorkItem, WorkItemStatus, WorkItemType
+
+MIN_NAME_LENGTH = 1
+MAX_NAME_LENGTH = 255
+MIN_DESCRIPTION_LENGTH = 1
+MAX_DESCRIPTION_LENGTH = 2000
+MAX_CHILDREN_COUNT = 100
+MAX_WORK_ITEMS_COUNT = 5000
+
+
+class WorkItemNotFoundError(ValueError):
+    """Raised when a work item is not found on the board."""
+    pass
+
+
+class WorkItemRelationshipError(ValueError):
+    """Raised when there's an issue with work item relationships."""
+    pass
+
+
+class WorkBoard(BaseModel):
+    """ Represents a collection of workitems """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, frozen=True)
+    created_at: datetime = Field(default_factory=datetime.now, frozen=True)
+    name: str = Field(min_length=MIN_NAME_LENGTH, max_length=MAX_NAME_LENGTH)
+    description: str = Field(min_length=MIN_DESCRIPTION_LENGTH, max_length=MAX_DESCRIPTION_LENGTH)
+    work_items: Dict[uuid.UUID, WorkItem] = Field(default_factory=dict, max_length=MAX_WORK_ITEMS_COUNT)
+
+    @model_validator(mode='after')
+    def validate_work_items_count(self):
+        """Validate that the number of work items is less than MAX_WORK_ITEMS_COUNT."""
+        if len(self.work_items) > MAX_WORK_ITEMS_COUNT:
+            raise ValueError(f"The number of work items must be less than {MAX_WORK_ITEMS_COUNT}")
+        return self
+    
+    # Basic CRUD
+    def create_work_item(
+        self,
+        work_item_type: WorkItemType,
+        title: str,
+        description: str,
+        parent_id: Optional[uuid.UUID] = None,
+        children_ids: Optional[List[uuid.UUID]] = None,
+        status: WorkItemStatus = WorkItemStatus.TO_DO
+    ) -> WorkItem:
+        
+        """ Create a new work item on the board """
+
+        # check that the number of work items does not exceed the maximum allowed
+        if len(self.work_items) >= MAX_WORK_ITEMS_COUNT:
+            raise ValueError(f"The number of work items must be less than {MAX_WORK_ITEMS_COUNT}")
+
+        # create the new work item
+        new_item = WorkItem(work_item_type=work_item_type, title=title, description=description, status=status)
+        self.work_items[new_item.id] = new_item
+
+        # add the new work item as a child to the parent if present
+        if parent_id is not None:
+            self.add_child(parent_id, new_item.id)
+
+        # add the new work item as a child of the parent if present
+        if children_ids is not None:
+            for child_id in children_ids:
+                self.add_child(new_item.id, child_id)
+        return new_item
+
+    def find_work_item(self, id: uuid.UUID) -> Optional[WorkItem]:
+        """ Return the work item if it exists, otherwise return None """
+        return self.work_items.get(id)
+
+    def get_work_item(self, id: uuid.UUID) -> Optional[WorkItem]:
+        """ Return the work item if it exists, otherwise raise an error """
+        item = self.find_work_item(id)
+        if item is None:
+            raise WorkItemNotFoundError(f"Work item {id} not found on board")
+        return item
+    
+    def update_work_item(self, id: uuid.UUID, **updates) -> WorkItem:
+        item = self.get_work_item(id)
+        updated_item = item.model_copy(update=updates)
+        self.work_items[id] = updated_item
+        return updated_item
+
+    def delete_work_item(self, id: uuid.UUID) -> None:
+        """ Delete a work item from the board and all references to it"""
+        item = self.get_work_item(id)
+
+        # Remove the reference to this item from its parent
+        if item.parent_id is not None:
+            self.remove_child(item.parent_id, id)
+
+        # Remove references to this item from its children
+        # Make a copy of the list to avoid modification during iteration
+        if item.children_ids:
+            children_ids_copy = list(item.children_ids)
+            for child_id in children_ids_copy:
+                self.remove_child(id, child_id)
+        del self.work_items[id]
+    
+    # Query methods
+    def list_work_items(self) -> List[WorkItem]:
+        return list(self.work_items.values())
+
+    def list_by_type(self, work_item_type: WorkItemType) -> List[WorkItem]:
+        return [item for item in self.work_items.values() if item.work_item_type == work_item_type]
+
+    def list_by_status(self, status: WorkItemStatus) -> List[WorkItem]:
+        return [item for item in self.work_items.values() if item.status == status]
+    
+    # Relationship methods
+    def add_child(self, parent_id: uuid.UUID, child_id: uuid.UUID) -> None:
+        """ Link two work items together as parent and child """
+        parent = self.get_work_item(parent_id)
+        child = self.get_work_item(child_id)
+
+        # check that the number of children is less than the maximum allowed
+        if len(parent.children_ids) >= MAX_CHILDREN_COUNT:
+            raise ValueError(f"The number of work items must be less than {MAX_CHILDREN_COUNT}")
+
+        # check that the child is not already a child of the parent
+        if child_id in parent.children_ids:
+            raise WorkItemRelationshipError(f"Child work item {child_id} is already a child of parent {parent_id}")
+        
+        # add the child to the parent's children list
+        parent.children_ids.append(child_id)
+
+        # set the child's parent reference to the parent
+        child.parent_id = parent_id
+
+    def remove_child(self, parent_id: uuid.UUID, child_id: uuid.UUID) -> None:
+        """ Remove the link between a parent and a child """
+        parent = self.get_work_item(parent_id)
+        child = self.get_work_item(child_id)
+
+        # check that the child is actually a child of the parent
+        if child_id not in parent.children_ids:
+            raise WorkItemRelationshipError(f"Child work item {child_id} is not a child of parent {parent_id}")
+
+        # remove the child from the parent's children list
+        parent.children_ids.remove(child_id)
+
+        # remove the parent reference from the child
+        child.parent_id = None
+        
+    def get_children(self, parent_id: uuid.UUID) -> List[WorkItem]:
+        """ Return all the children of a parent """
+        parent = self.get_work_item(parent_id)
+        if parent is None:
+            raise WorkItemNotFoundError(f"Parent work item {parent_id} not found on board")
+        return [self.get_work_item(child_id) for child_id in parent.children_ids]
+    
+    def get_parent(self, child_id: uuid.UUID) -> Optional[WorkItem]:
+        """ Return the parent of a child, if it exists, otherwise return None """
+        child = self.get_work_item(child_id)
+        if child.parent_id is None:
+            return None
+        return self.get_work_item(child.parent_id)
