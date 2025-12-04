@@ -149,8 +149,6 @@ class WorkBoard(BaseModel):
     def get_children(self, parent_id: uuid.UUID) -> List[WorkItem]:
         """ Return all the children of a parent """
         parent = self.get_work_item(parent_id)
-        if parent is None:
-            raise WorkItemNotFoundError(f"Parent work item {parent_id} not found on board")
         return [self.get_work_item(child_id) for child_id in parent.children_ids]
     
     def get_parent(self, child_id: uuid.UUID) -> Optional[WorkItem]:
